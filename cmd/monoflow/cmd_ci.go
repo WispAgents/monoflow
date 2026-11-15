@@ -442,6 +442,16 @@ func printOuterJob(job *verify.OuterJob) {
 		"duration_ms": job.DurationMs,
 		"packages":    fmt.Sprintf("%d/%d passed", job.PassedPackages, job.TotalPackagesTested),
 	}
+	if job.Status == verify.JobRunning || job.Status == verify.JobQueued {
+		// Results are written when the job ends: "duration 0, 0/0 passed" read as a stuck job.
+		delete(out, "duration_ms")
+		out["elapsed"] = time.Since(job.StartedAt).Round(time.Second).String()
+		if n := len(job.TransitivePackages); n > 0 {
+			out["packages"] = fmt.Sprintf("%d to check (results when the job ends)", n)
+		} else {
+			out["packages"] = "being planned"
+		}
+	}
 	var failed []verify.TargetResult
 	for _, r := range job.TargetResults {
 		if r.Status != "passed" {
