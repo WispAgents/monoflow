@@ -70,6 +70,26 @@ type Edge struct {
 	Problem           string `json:"problem,omitempty"`
 }
 
+// namesFor maps the names p's manifest uses to packages: byName, plus each name several
+// packages share (see AddPackage) resolved to the one of p's ecosystem.
+func (g *DependencyGraph) namesFor(p *PackageNode, byName map[string]*PackageNode) map[string]*PackageNode {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if len(g.aliases) == 0 {
+		return byName
+	}
+	view := make(map[string]*PackageNode, len(byName)+len(g.aliases))
+	for k, v := range byName {
+		view[k] = v
+	}
+	for base := range g.aliases {
+		if c := g.resolveAlias(base, p); len(c) == 1 {
+			view[base] = g.packages[c[0]]
+		}
+	}
+	return view
+}
+
 // ScanEdges reads every package manifest and returns its in-repo dependency edges.
 func (g *DependencyGraph) ScanEdges() []Edge {
 	pkgs := g.GetAllPackages()
@@ -98,11 +118,11 @@ func (g *DependencyGraph) ScanEdges() []Edge {
 		read := func(name string) string { return manifest(g.RootDir, filepath.Join(p.Path, name)) }
 		switch p.Language {
 		case LangJavaScript, LangTypeScript:
-			edges = append(edges, npmEdges(p, read("package.json"), byName)...)
+			edges = append(edges, npmEdges(p, read("package.json"), g.namesFor(p, byName))...)
 		case LangGo:
 			edges = append(edges, goEdges(p, read("go.mod"), byGoModule, goWork)...)
 		case LangRust:
-			edges = append(edges, cargoEdges(p, read("Cargo.toml"), byName, cargoWorkspaceDeps)...)
+			edges = append(edges, cargoEdges(p, read("Cargo.toml"), g.namesFor(p, byName), cargoWorkspaceDeps)...)
 		case LangPython:
 			edges = append(edges, pythonEdges(p, read("pyproject.toml"), byPy)...)
 		}
@@ -205,7 +225,7 @@ func npmEdges(p *PackageNode, content string, byName map[string]*PackageNode) []
 				continue
 			}
 			seen[name] = true
-			e := Edge{Consumer: p.Name, Dependency: name, Ecosystem: "npm", Constraint: spec, DependencyVersion: dep.Version}
+			e := Edge{Consumer: p.Name, Dependency: dep.Name, Ecosystem: "npm", Constraint: spec, DependencyVersion: dep.Version}
 			local := strings.HasPrefix(spec, "workspace:") || strings.HasPrefix(spec, "file:") || strings.HasPrefix(spec, "link:") || strings.HasPrefix(spec, "portal:")
 			if strings.HasPrefix(spec, "file:") || strings.HasPrefix(spec, "link:") || strings.HasPrefix(spec, "portal:") {
 				e.Constraint = ""
@@ -349,7 +369,7 @@ func cargoEdges(p *PackageNode, content string, byName map[string]*PackageNode, 
 		if dep.Name == p.Name {
 			continue
 		}
-		e := Edge{Consumer: p.Name, Dependency: name, Ecosystem: "cargo", Constraint: s.version, DependencyVersion: dep.Version}
+		e := Edge{Consumer: p.Name, Dependency: dep.Name, Ecosystem: "cargo", Constraint: s.version, DependencyVersion: dep.Version}
 		check(semver.EcoCargo, &e)
 		if _, _, rel := ReleaseRef(s.path); rel {
 			pinnedOrSource(&e, s.path)

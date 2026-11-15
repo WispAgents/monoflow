@@ -26,7 +26,11 @@ const (
 
 // PackageNode represents a hermetic package within the monorepo.
 type PackageNode struct {
-	Name         string   `json:"name"`
+	Name string `json:"name"`
+	// ManifestName is the name in the package's manifest when Name is not it: packages sharing
+	// a name are kept as name@path (see QualifiedName), and manifests, task-runner filters and
+	// package managers only know the plain name.
+	ManifestName string   `json:"manifest_name,omitempty"`
 	Path         string   `json:"path"` // Relative to root
 	Language     Language `json:"language"`
 	Version      string   `json:"version,omitempty"`
@@ -65,7 +69,9 @@ type DependencyGraph struct {
 	mu            sync.RWMutex
 	RootDir       string
 	VerifyExclude []string // see Config.VerifyExclude
+	Settings      Settings // see LoadSettings
 	packages      map[string]*PackageNode
+	aliases       map[string][]string        // a name several packages share -> their name@path names
 	upstreamMap   map[string]map[string]bool // pkg -> set of dependencies
 	downstreamMap map[string]map[string]bool // pkg -> set of dependents
 }
@@ -75,6 +81,7 @@ func New(rootDir string) *DependencyGraph {
 	return &DependencyGraph{
 		RootDir:       rootDir,
 		packages:      make(map[string]*PackageNode),
+		aliases:       make(map[string][]string),
 		upstreamMap:   make(map[string]map[string]bool),
 		downstreamMap: make(map[string]map[string]bool),
 	}
@@ -83,6 +90,7 @@ func New(rootDir string) *DependencyGraph {
 // LoadOrDiscover initializes the graph from config or auto-detects from disk.
 func LoadOrDiscover(rootDir string) (*DependencyGraph, error) {
 	g := New(rootDir)
+	g.Settings = LoadSettings(rootDir)
 	configPath := filepath.Join(rootDir, ".agents", "monoflow.config.json")
 
 	if _, err := os.Stat(configPath); err == nil {
@@ -169,6 +177,34 @@ func (g *DependencyGraph) AddPackage(pkg *PackageNode) {
 	cleanPath = strings.TrimPrefix(cleanPath, string(filepath.Separator))
 	pkg.Path = cleanPath
 
+	// Same name, other directory (an npm workspace and a Cargo crate both called "wisp"): keep
+	// every one, each under name@path, and warn. Keeping one dropped the others from the graph
+	// and from verify --all without a word (#35).
+	if existing, ok := g.packages[pkg.Name]; ok && existing.Path != pkg.Path {
+		base := pkg.Name
+		delete(g.packages, base)
+		delete(g.upstreamMap, base)
+		delete(g.downstreamMap, base)
+		existing.ManifestName, existing.Name = base, QualifiedName(base, existing.Path)
+		g.packages[existing.Name] = existing
+		g.upstreamMap[existing.Name] = make(map[string]bool)
+		g.downstreamMap[existing.Name] = make(map[string]bool)
+		g.aliases[base] = append(g.aliases[base], existing.Name)
+	}
+	if _, clash := g.aliases[pkg.Name]; clash {
+		base := pkg.Name
+		pkg.ManifestName, pkg.Name = base, QualifiedName(base, pkg.Path)
+		if !containsString(g.aliases[base], pkg.Name) {
+			g.aliases[base] = append(g.aliases[base], pkg.Name)
+		}
+	}
+	// Loaded from a config saved earlier: already name@path; remember the name it shares.
+	if base, ok := strings.CutSuffix(pkg.Name, QualifiedName("", pkg.Path)); ok && base != "" {
+		pkg.ManifestName = base
+		if !containsString(g.aliases[base], pkg.Name) {
+			g.aliases[base] = append(g.aliases[base], pkg.Name)
+		}
+	}
 	g.packages[pkg.Name] = pkg
 	if _, ok := g.upstreamMap[pkg.Name]; !ok {
 		g.upstreamMap[pkg.Name] = make(map[string]bool)
@@ -192,14 +228,133 @@ func (g *DependencyGraph) RebuildEdges() {
 	}
 
 	for name, pkg := range g.packages {
+		resolved := pkg.Dependencies[:0:0]
 		for _, dep := range pkg.Dependencies {
-			// Only link if the dependency is also a package within this monorepo
-			if _, exists := g.packages[dep]; exists {
-				g.upstreamMap[name][dep] = true
-				g.downstreamMap[dep][name] = true
+			targets := []string{dep}
+			if _, exists := g.packages[dep]; !exists && len(g.aliases[dep]) > 0 {
+				targets = g.resolveAlias(dep, pkg)
+			}
+			for _, t := range targets {
+				// Only link if the dependency is also a package within this monorepo
+				if _, exists := g.packages[t]; exists && t != name {
+					g.upstreamMap[name][t] = true
+					g.downstreamMap[t][name] = true
+				}
+				resolved = append(resolved, t)
 			}
 		}
+		if len(g.aliases) > 0 && pkg.Dependencies != nil {
+			pkg.Dependencies = dedupe(resolved)
+		}
 	}
+}
+
+// RawName is the name the package's manifest uses (see ManifestName).
+func (p *PackageNode) RawName() string {
+	if p.ManifestName != "" {
+		return p.ManifestName
+	}
+	return p.Name
+}
+
+// QualifiedName is how a package whose name another package also has is addressed: name@path
+// ("wisp@crates/wisp"; "name@root" for the repository root).
+func QualifiedName(name, path string) string {
+	path = filepath.ToSlash(path)
+	if path == "" || path == "." {
+		path = "root"
+	}
+	return name + "@" + path
+}
+
+// resolveAlias picks which of the packages sharing the name dep a dependency of from means.
+// Manifests name packages of their own ecosystem (a Cargo crate depends on the crate, never on
+// the npm package), so: the ones of the same ecosystem (all of them if several: an edge too many
+// is safe, one too few is not), else language-neutral ones (proto contracts, generic packages).
+func (g *DependencyGraph) resolveAlias(dep string, from *PackageNode) []string {
+	var same, neutral []string
+	for _, n := range g.aliases[dep] {
+		p := g.packages[n]
+		switch {
+		case p == nil:
+		case ecosystem(p.Language) == ecosystem(from.Language):
+			same = append(same, n)
+		case p.Language == LangProto || p.Language == LangGeneric || p.Language == "":
+			neutral = append(neutral, n)
+		}
+	}
+	if len(same) > 0 {
+		return same
+	}
+	return neutral
+}
+
+func ecosystem(l Language) string {
+	if l == LangTypeScript || l == LangJavaScript {
+		return "js"
+	}
+	return string(l)
+}
+
+// DuplicateNames lists, for every name several packages share, the paths of those packages.
+func (g *DependencyGraph) DuplicateNames() map[string][]string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	out := map[string][]string{}
+	for base, names := range g.aliases {
+		for _, n := range names {
+			if p := g.packages[n]; p != nil {
+				out[base] = append(out[base], p.Path)
+			}
+		}
+		if len(out[base]) < 2 {
+			delete(out, base)
+			continue
+		}
+		sort.Strings(out[base])
+	}
+	return out
+}
+
+// Warnings describes what the graph could not take as it is (packages sharing a name).
+func (g *DependencyGraph) Warnings() []string {
+	dups := g.DuplicateNames()
+	bases := make([]string, 0, len(dups))
+	for b := range dups {
+		bases = append(bases, b)
+	}
+	sort.Strings(bases)
+	var out []string
+	for _, b := range bases {
+		var names []string
+		for _, p := range dups[b] {
+			names = append(names, QualifiedName(b, p))
+		}
+		out = append(out, fmt.Sprintf("%d packages are named %q (%s): each is kept, addressed as %s",
+			len(dups[b]), b, strings.Join(dups[b], ", "), strings.Join(names, ", ")))
+	}
+	return out
+}
+
+func containsString(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func dedupe(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func (g *DependencyGraph) rebuildEdges() {
@@ -219,6 +374,9 @@ func (g *DependencyGraph) GetPackage(name string) (*PackageNode, bool) {
 		if filepath.ToSlash(p.Path) == clean {
 			return p, true
 		}
+	}
+	if len(g.aliases[name]) > 0 {
+		return nil, false // several packages have this name: name@path picks one
 	}
 	// Last resort: a unique short name ("money" for libs/money, "ui" for @acme/ui).
 	var match *PackageNode
@@ -353,24 +511,45 @@ type AffectedResult struct {
 	DirectlyChanged    []string `json:"directly_changed"`
 	TransitiveAffected []string `json:"transitive_affected"`
 	AllAffected        []string `json:"all_affected"`
+	// Unmapped are changed files no package owns and no global_inputs / ignore_inputs pattern
+	// names: they affect nothing unless "unmapped": "all" is set, so the affected set may miss
+	// what they reach. GlobalInputs are the changed files that affect every package.
+	Unmapped     []string `json:"unmapped,omitempty"`
+	GlobalInputs []string `json:"global_inputs,omitempty"`
 }
 
 // ComputeAffected computes direct and transitive affected packages from a list of modified files.
 func (g *DependencyGraph) ComputeAffected(changedFiles []string) AffectedResult {
 	directMap := make(map[string]bool)
-	for _, f := range changedFiles {
-		if IsNonCodeFile(f) {
-			continue
+	var unmapped, global []string
+	all := func() {
+		for _, p := range g.GetAllPackages() {
+			directMap[p.Name] = true
 		}
-		if IsGlobalFile(f) {
+	}
+	for _, f := range changedFiles {
+		switch {
+		case MatchInput(g.Settings.IgnoreInputs, f):
+			// affects nothing, on purpose
+		case MatchInput(g.Settings.GlobalInputs, f):
+			global = append(global, f)
+			all()
+		case IsNonCodeFile(f):
+		case IsGlobalFile(f):
 			// Workspace-level config (go.work, lockfiles, CI) can break every package,
 			// even when a root package technically owns the file; remote CI re-runs
 			// everything, so must we.
-			for name := range g.packages {
-				directMap[name] = true
+			global = append(global, f)
+			all()
+		default:
+			if pkg := g.MapFileToPackage(f); pkg != nil {
+				directMap[pkg.Name] = true
+			} else {
+				unmapped = append(unmapped, f)
+				if g.Settings.Unmapped == "all" {
+					all()
+				}
 			}
-		} else if pkg := g.MapFileToPackage(f); pkg != nil {
-			directMap[pkg.Name] = true
 		}
 	}
 
@@ -397,6 +576,8 @@ func (g *DependencyGraph) ComputeAffected(changedFiles []string) AffectedResult 
 		DirectlyChanged:    directList,
 		TransitiveAffected: transitiveList,
 		AllAffected:        allList,
+		Unmapped:           unmapped,
+		GlobalInputs:       global,
 	}
 }
 
@@ -457,7 +638,7 @@ func toSortedList(m map[string]bool) []string {
 	return res
 }
 
-var globalFilePattern = regexp.MustCompile(`^(go\.work(\.sum)?|package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|bun\.lockb?|tsconfig[^/]*\.json|turbo\.json|nx\.json|Cargo\.(toml|lock)|uv\.lock|poetry\.lock|pdm\.lock|pyproject\.toml|\.python-version|Makefile|\.tool-versions|\.nvmrc|\.go-version|ci/.+|\.github/workflows/.+|\.agents/monoflow\.config\.json)$`)
+var globalFilePattern = regexp.MustCompile(`^(go\.work(\.sum)?|package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|bun\.lockb?|tsconfig[^/]*\.json|turbo\.json|nx\.json|Cargo\.(toml|lock)|uv\.lock|poetry\.lock|pdm\.lock|pyproject\.toml|\.python-version|Makefile|rust-toolchain(\.toml)?|\.cargo/config(\.toml)?|\.npmrc|\.yarnrc\.yml|bunfig\.toml|lerna\.json|\.github/actions/.+|\.tool-versions|\.nvmrc|\.go-version|ci/.+|\.github/workflows/.+|\.agents/monoflow\.config\.json)$`)
 
 // IsGlobalFile reports whether a repo-relative path is workspace-wide configuration
 // whose change can affect every package.

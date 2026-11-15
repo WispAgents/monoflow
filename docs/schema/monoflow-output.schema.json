@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/M0xoo/monoflow/docs/schema/monoflow-output.schema.json",
+  "title": "MonoFlow --json output, schema 1",
+  "description": "Every JSON object MonoFlow prints with --json starts with \"schema\": 1. Within schema 1 fields are only added; a rename or removal bumps the version, and the old name is still printed for one more version. Lists (checkpoint list, graph) are printed as they are, without the field.",
+  "type": "object",
+  "required": ["schema"],
+  "properties": {
+    "schema": { "const": 1 },
+    "status": { "type": "string" },
+    "error": { "type": "string" }
+  },
+  "$defs": {
+    "error": {
+      "description": "Any command that fails: status error|failed|refused and a message. Unknown flags exit 2 with code unknown_flag.",
+      "type": "object",
+      "required": ["schema", "error"],
+      "properties": {
+        "schema": { "const": 1 },
+        "status": { "type": "string" },
+        "code": { "enum": ["unknown_flag"] },
+        "error": { "type": "string" },
+        "flags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "verify": {
+      "description": "monoflow verify --json (compact). With --verbose the full SuiteResult: status, results[] (target, status, errors[] {file, line, col, code, message}).",
+      "type": "object",
+      "required": ["schema", "status"],
+      "properties": {
+        "schema": { "const": 1 },
+        "status": { "enum": ["passed", "failed", "refused"] },
+        "affected_packages": { "type": "array", "items": { "type": "string" } },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "file": { "type": "string" }, "line": { "type": "integer" }, "col": { "type": "integer" },
+              "code": { "type": "string" }, "message": { "type": "string" },
+              "targets": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "pending": { "type": "array", "items": { "type": "string" } },
+        "unmapped": { "type": "array", "items": { "type": "string" }, "description": "changed files no package owns (see global_inputs / ignore_inputs)" },
+        "scope": { "type": "string" },
+        "next": { "type": "string" }
+      }
+    },
+    "graph_impact": {
+      "description": "monoflow graph impact <file> --json",
+      "type": "object",
+      "required": ["schema"],
+      "properties": {
+        "schema": { "const": 1 },
+        "file": { "type": "string" },
+        "package": { "type": "string", "description": "owning package" },
+        "owning_package": { "type": "string", "deprecated": true, "description": "old name of package; printed in schema 1 only" },
+        "impact": { "enum": ["global", "unmapped", "none"], "description": "only when no single package owns the file" },
+        "dependents": { "type": "integer" },
+        "direct": { "type": "integer" },
+        "dependent_packages": { "type": "array", "items": { "type": "string" } },
+        "dependents_first_30": { "type": "array", "items": { "type": "string" } },
+        "pinned_dependents": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "graph_affected": {
+      "description": "monoflow graph affected --json",
+      "type": "object",
+      "required": ["schema", "changed_files", "directly_changed", "transitive_affected", "all_affected"],
+      "properties": {
+        "schema": { "const": 1 },
+        "changed_files": { "type": "array", "items": { "type": "string" } },
+        "directly_changed": { "type": "array", "items": { "type": "string" } },
+        "transitive_affected": { "type": "array", "items": { "type": "string" } },
+        "all_affected": { "type": "array", "items": { "type": "string" } },
+        "unmapped": { "type": "array", "items": { "type": "string" } },
+        "global_inputs": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "checkpoint": {
+      "description": "monoflow checkpoint save|revert --json",
+      "type": "object",
+      "required": ["schema", "status"],
+      "properties": {
+        "schema": { "const": 1 },
+        "status": { "enum": ["saved", "reverted", "refused"] },
+        "id": { "type": "string" },
+        "checkpoint": { "type": "string" },
+        "files": { "type": "array", "items": { "type": "string" } },
+        "untracked": { "type": "array", "items": { "type": "string" } },
+        "staged": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

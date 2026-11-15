@@ -60,7 +60,7 @@ func TestImproveRetroAfterSession(t *testing.T) {
 	if out, code := run("", "improve", "add", "graph query should suggest close package names", "--area=graph", "--kind=friction", "--evidence=graph query no-such-package"); code != 0 || !strings.Contains(out, "filed s") {
 		t.Fatalf("improve add: %d %s", code, out)
 	}
-	if out, code := run("", "improve", "add", "x", "--bogus=1"); code != 1 || !strings.Contains(out, "unknown flag") {
+	if out, code := run("", "improve", "add", "x", "--bogus=1"); code != 2 || !strings.Contains(out, "unknown flag") {
 		t.Fatalf("unknown flags are refused: %d %s", code, out)
 	}
 	if out, _ := run("", "improve", "done"); !strings.Contains(out, "1 suggestion") {

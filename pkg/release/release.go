@@ -218,11 +218,11 @@ func Repoint(root string, g *graph.DependencyGraph, consumer, dep, version strin
 		setOwnGoWork(root, cdir, version != "")
 		return repointGo(cdir, root, d, rel)
 	case graph.LangJavaScript, graph.LangTypeScript:
-		return repointNPM(cdir, root, d.Name, rel, version)
+		return repointNPM(cdir, root, d.RawName(), rel, version)
 	case graph.LangRust:
-		return repointCargo(cdir, d.Name, rel, version)
+		return repointCargo(cdir, d.RawName(), rel, version)
 	case graph.LangPython:
-		return repointPython(cdir, d.Name, rel)
+		return repointPython(cdir, d.RawName(), rel)
 	}
 	return "", fmt.Errorf("pinning is not supported for %s packages", c.Language)
 }

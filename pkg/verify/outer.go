@@ -348,6 +348,7 @@ func (om *OuterLoopManager) executeJobInternal(job *OuterJob) error {
 		revertErr := ""
 		if job.AutoRevert {
 			chkMgr := checkpoint.NewManager(om.RootDir)
+			chkMgr.Shared = graph.LoadSettings(om.RootDir).SharedWorktree
 			if err := chkMgr.Revert(""); err == nil {
 				job.RollbackTriggered = true
 				job.Status = JobRolledBack

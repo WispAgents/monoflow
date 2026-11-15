@@ -304,6 +304,7 @@ func handleOuter(rootDir string) {
 			} else if arg == "--push" || arg == "--auto-push" {
 				opts.AutoPush = true
 			} else if arg == "--revert" || arg == "--auto-revert" {
+				refuseInSharedWorktree(rootDir, "outer start --revert")
 				opts.AutoRevert = true
 			} else if arg == "--async" {
 				opts.Async = true

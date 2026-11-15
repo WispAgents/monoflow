@@ -42,6 +42,7 @@ func main() {
 		printCommandUsage(cmd)
 		exit(0)
 	}
+	rejectUnknownFlags(cmd, os.Args[2:])
 
 	rootDir, err := findRepoRoot()
 	if err != nil && cmd != "init" && cmd != "clone" {
@@ -59,6 +60,9 @@ func main() {
 
 	case "init":
 		handleInit(rootDir)
+
+	case "uninit":
+		handleUninit(rootDir)
 
 	case "graph":
 		handleGraph(rootDir)
@@ -186,7 +190,8 @@ Agent path (4 calls):
   monoflow improve                    Before you finish: retro on MonoFlow; file what it should do better
 
 Usage:
-  monoflow init [dir] [--setup-gh-actions]  Install MonoFlow (+ economical affected-only GitHub Actions CI)
+  monoflow init [dir] [--setup-gh-actions] [--with=<c,..>|--minimal]  Install MonoFlow (+ economical affected-only GitHub Actions CI)
+  monoflow uninit                     Remove init's hooks, git shim, agent configs and AGENTS.md section (graph stays)
   monoflow clone <url> [dest] --packages=<p1,p2> Partial clone of selected packages and their dependencies
   monoflow subset [set|add|remove|update|deps|check|status|reset] Manage package subset projection & dependency health
   monoflow graph [query|impact]       Query upstream/downstream dependencies & impact
@@ -246,7 +251,10 @@ Changelogs, build output and generated reference docs left out. Use instead of g
   graph impact <file>                 Owning package and dependents affected by editing <file>
   graph affected                      Packages affected by the current uncommitted changes`,
 	"checkpoint": `  checkpoint save "<hypothesis>"      Snapshot the working tree (not git history)
-  checkpoint revert [id]              Restore the latest (or given) checkpoint
+  checkpoint revert [id] [--force]    Restore the latest (or given) checkpoint. Only files that differ are
+                                      written and the index is left alone; it refuses when new or staged
+                                      files the checkpoint does not know about exist (another agent's work
+                                      in a shared worktree). --force discards them too
   checkpoint list                     List checkpoints`,
 	"verify": `  verify --affected                   Test/lint/typecheck packages affected by your changes (+ dependents)
   verify --package=<p> | --all        Verify one package / every package
@@ -318,6 +326,16 @@ M0xoo/monoflow through gh, paths/remotes/e-mails/secrets redacted; "improve": {"
   sync --merge                        Merge the base instead (resolve conflicts once, then 'monoflow commit')
   sync --stacked-on=<parent-branch>   Stacked PR whose parent was squash-merged: replay only this branch's commits
   sync [remote] [branch] [--rebase] [--autostash]   Explicit remote/branch`,
+	"init": `  init [dir]                          Graph + verify config, plus every component: agents, harness, hooks, shim
+  init --with=<c1,c2>                 Only those components besides graph + verify:
+                                        agents   MonoFlow section in AGENTS.md / CLAUDE.md, rules and skill
+                                        harness  .claude/settings.json hooks + opencode plugin (event delivery)
+                                        hooks    git shield hooks in .git/hooks (block raw git commit / push;
+                                                 shared by every worktree and the main checkout)
+                                        shim     .agents/bin/git interception shim
+  init --minimal                      Graph + verify only (= --with=none)
+  init --setup-gh-actions             Also write an affected-only GitHub Actions workflow
+  uninit                              Remove the components again; config and binary stay`,
 	"branch": `  branch                              List branches
   branch <name> [-c|--create]         Switch to (or create) a branch`,
 }

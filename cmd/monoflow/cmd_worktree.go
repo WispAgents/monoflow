@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 
 func handleCheckpoint(rootDir string) {
 	mgr := checkpoint.NewManager(rootDir)
+	mgr.Shared = graph.LoadSettings(rootDir).SharedWorktree
 	if len(os.Args) < 3 {
 		printRaw(`{"error": "missing checkpoint subcommand: save | revert | list"}`)
 		exit(1)
@@ -44,13 +46,32 @@ func handleCheckpoint(rootDir string) {
 		})
 
 	case "revert":
-		targetID := ""
-		if len(os.Args) > 3 {
-			targetID = os.Args[3]
+		targetID, force := "", false
+		for _, a := range os.Args[3:] {
+			if a == "--force" {
+				force = true
+			} else if targetID == "" {
+				targetID = a
+			}
+		}
+		if force {
+			refuseInSharedWorktree(rootDir, "checkpoint revert --force")
 		}
 		start := time.Now()
-		cp, err := mgr.RevertCheckpoint(targetID)
+		cp, err := mgr.RevertCheckpoint(targetID, force)
 		durMs := float64(time.Since(start).Microseconds()) / 1000.0
+		var foreign *checkpoint.ForeignChangesError
+		if errors.As(err, &foreign) {
+			printOut(map[string]any{
+				"status":    "refused",
+				"error":     err.Error(),
+				"untracked": foreign.Untracked,
+				"staged":    foreign.Staged,
+				"modified":  foreign.Modified,
+				"hint":      "nothing was changed; pass --force to discard these files as well",
+			})
+			exit(1)
+		}
 		if err != nil {
 			printRaw(fmt.Sprintf(`{"error": %q}`, err))
 			exit(1)
