@@ -103,6 +103,13 @@ func TestHelpFlagsExitZero(t *testing.T) {
 // Background baseline warm-ups would write into test repos while they are being removed; the
 // test that checks them turns them back on.
 func TestMain(m *testing.M) {
+	// Switches from the caller's shell must not reach the binaries under test: local CI ran this
+	// suite from a `MONOFLOW_NO_SPECULATE=1 monoflow commit`, and every speculation test failed
+	// (no background run ever started). Tests that want them set them per command.
+	for _, k := range []string{"MONOFLOW_NO_SPECULATE", "MONOFLOW_SHARED_WORKTREE", "MONOFLOW_SPECULATE_HERE",
+		"MONOFLOW_RECORD_KEY", "MONOFLOW_NO_BATCH", "MONOFLOW_FORMAT", "CI", "GITHUB_ACTIONS"} {
+		_ = os.Unsetenv(k)
+	}
 	_ = os.Setenv("MONOFLOW_NO_WARM", "1")
 	_ = os.Setenv("MONOFLOW_NO_ROOT_SPECULATE", "1")
 	os.Exit(m.Run())

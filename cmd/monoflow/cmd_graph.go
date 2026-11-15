@@ -16,6 +16,7 @@ func handleGraph(rootDir string) {
 		printRaw(fmt.Sprintf(`{"error": %q}`, err))
 		exit(1)
 	}
+	printGraphWarnings(g)
 
 	if len(os.Args) == 2 {
 		// Output full graph in JSON
@@ -102,9 +103,28 @@ func handleGraph(rootDir string) {
 			exit(1)
 		}
 		filePath := os.Args[3]
-		pkg := g.MapFileToPackage(filePath)
-		if pkg == nil {
-			printRaw(fmt.Sprintf(`{"file": %q, "impact": "none (untracked/root file)"}`, filePath))
+		rel := filePath
+		if abs, err := filepath.Abs(filePath); err == nil {
+			if r, err := filepath.Rel(rootDir, abs); err == nil && !strings.HasPrefix(r, "..") {
+				rel = filepath.ToSlash(r)
+			}
+		}
+		pkg := g.MapFileToPackage(rel)
+		if aff := g.ComputeAffected([]string{rel}); len(aff.GlobalInputs) > 0 {
+			printOut(map[string]any{"file": filePath, "impact": "global",
+				"note":       "a global input: it affects every package",
+				"dependents": len(aff.AllAffected)})
+			return
+		} else if pkg == nil || len(aff.AllAffected) == 0 {
+			impact := "none"
+			if len(aff.Unmapped) > 0 {
+				impact = "unmapped"
+			}
+			out := map[string]any{"file": filePath, "impact": impact}
+			if impact == "unmapped" {
+				out["note"] = "no package owns this file, so verify --affected checks nothing for it; list it in global_inputs (affects every package) or ignore_inputs in .agents/monoflow.config.json"
+			}
+			printOut(out)
 			return
 		}
 		// Compact for agents: one dependents list (direct ones are a subset of it).
@@ -123,6 +143,10 @@ func handleGraph(rootDir string) {
 		if pinned := pinnedDependents(g, pkg.Name); len(pinned) > 0 {
 			out["pinned_dependents"] = pinned
 			out["pinned_note"] = "they build against a release of this package: unaffected now, notified on its next release"
+		}
+		if jsonMode() {
+			out["owning_package"] = pkg.Name // schema 0 name of "package"; kept for one version (#39)
+			out["file"] = filePath
 		}
 		printOut(out)
 

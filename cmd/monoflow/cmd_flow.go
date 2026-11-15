@@ -75,6 +75,7 @@ func handleShip(rootDir string) {
 			printRaw(`{"error": "uncommitted changes: pass -m \"<commit message>\""}`)
 			exit(1)
 		}
+		refuseInSharedWorktree(rootDir, "ship (moving this checkout's uncommitted work into a new worktree)")
 		wt, err := moveWorkToWorktree(exe, rootDir, msg)
 		if err != nil {
 			printRaw(fmt.Sprintf(`{"error": %q}`, "could not move your changes off "+b+": "+err.Error()))

@@ -21,16 +21,26 @@ import (
 func handleInit(rootDir string) {
 	targetDir := "."
 	setupGH := false
+	var opts initialize.Options
 	for _, a := range os.Args[2:] {
 		if a == "--setup-gh-actions" {
 			setupGH = true
+		} else if a == "--minimal" {
+			opts.With = []string{} // graph and verify only
+		} else if strings.HasPrefix(a, "--with=") {
+			with, err := initialize.ParseComponents(strings.TrimPrefix(a, "--with="))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "monoflow init: "+err.Error())
+				exit(2)
+			}
+			opts.With = with
 		} else if !strings.HasPrefix(a, "-") {
 			targetDir = a
 		}
 	}
 
 	selfBin, _ := os.Executable()
-	res, err := initialize.InitRepo(targetDir, selfBin)
+	res, err := initialize.InitRepoWith(targetDir, selfBin, opts)
 	if err != nil {
 		fmt.Printf("Error initializing repo: %v\n", err)
 		exit(1)
@@ -52,7 +62,19 @@ func handleInit(rootDir string) {
 		"rule_file":           filepath.Join(res.RepoRoot, ".agents", "rules", "agentic-monorepo.md"),
 		"skill_file":          filepath.Join(res.RepoRoot, ".agents", "skills", "monoflow", "SKILL.md"),
 		"workflow_file":       workflowPath,
+		"installed":           res.Installed,
 	})
+}
+
+// handleUninit removes what init installed besides the graph (see initialize.Uninit).
+func handleUninit(rootDir string) {
+	res, err := initialize.Uninit(rootDir)
+	if err != nil {
+		printRaw(fmt.Sprintf(`{"status": "error", "error": %q}`, err))
+		exit(1)
+	}
+	printOut(map[string]any{"status": "uninstalled", "removed": res.Removed, "kept": res.Kept,
+		"note": "the graph config (.agents/monoflow.config.json) and the binary are kept: graph and verify still work"})
 }
 
 func handleTask(rootDir string) {

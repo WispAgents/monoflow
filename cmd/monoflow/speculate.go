@@ -66,7 +66,7 @@ func treeStateKey(root string) string {
 // touched since are cache hits by the time it asks; the newest state starts once it is done.
 // It reports whether the current state is handled (started, running or done).
 func maybeVerifyInBackground(root string) bool {
-	if os.Getenv("MONOFLOW_RECORD_KEY") != "" || os.Getenv("MONOFLOW_NO_SPECULATE") != "" {
+	if os.Getenv("MONOFLOW_RECORD_KEY") != "" || speculationOff(root) {
 		return true
 	}
 	// In agent worktrees, or in a checkout whose own verify started the watcher (the agent
@@ -331,7 +331,7 @@ func pruneSpecResults(dir string, keep int) {
 
 // startSpeculateWatcher launches the detached watcher for a new worktree.
 func startSpeculateWatcher(wt string) {
-	if os.Getenv("MONOFLOW_NO_SPECULATE") != "" {
+	if speculationOff(wt) {
 		return
 	}
 	if _, err := os.Stat(wt); err != nil {
@@ -431,7 +431,7 @@ func speculationAllowed(root string) bool {
 // while they edit: trpc A-14 worked in the root and its verifies ran cold, 80-125 s). Read-only
 // (no formatting, no file removal), one watcher at a time, gone after 15 idle minutes.
 func startRootWatcher(root string) {
-	if inWorktree(root) || os.Getenv("MONOFLOW_NO_SPECULATE") != "" || os.Getenv("MONOFLOW_NO_ROOT_SPECULATE") != "" {
+	if inWorktree(root) || speculationOff(root) || os.Getenv("MONOFLOW_NO_ROOT_SPECULATE") != "" {
 		return
 	}
 	if data, err := os.ReadFile(filepath.Join(specDir(root), "watch.pid")); err == nil {

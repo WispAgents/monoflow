@@ -132,12 +132,110 @@ type testManifest struct {
 	Ran   []string          `json:"ran"`   // the files the full run executed
 }
 
+// vitestPlan is what an incremental vitest run of one package has to run: every test file
+// (full) or the pending ones, and how to record the results.
+type vitestPlan struct {
+	inv     vitestInvocation
+	c       string            // the package's test command (without -u)
+	srcKey  string            // key of the package's inputs other than its test files
+	current map[string]string // package-relative test file -> content hash
+	full    bool
+	pending []string // package-relative files to run when !full (none: all passed already)
+}
+
+// fileKey is the cache key of one test file's pass on the plan's inputs.
+func (p *vitestPlan) fileKey(f string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\n%s\n%s\n", p.srcKey, f, p.current[f])
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// filters are the positional arguments selecting what the plan runs: the package filter for a
+// full run, else the pending files (repo-relative when the invocation runs from the root).
+func (p *vitestPlan) filters(pkg *graph.PackageNode) []string {
+	if p.full {
+		if p.inv.filter == "" {
+			return nil
+		}
+		return []string{p.inv.filter}
+	}
+	files := make([]string, len(p.pending))
+	for i, f := range p.pending {
+		files[i] = f
+		if p.inv.root {
+			files[i] = path.Join(filepath.ToSlash(pkg.Path), f)
+		}
+	}
+	return files
+}
+
+// planVitest works out the incremental run of a vitest test command c (without -u). ok=false:
+// not applicable, run c as usual.
+func (r *Runner) planVitest(pkg *graph.PackageNode, c, absPkgPath string, opt VerifyOptions) (*vitestPlan, bool) {
+	if r.cacheMgr == nil || opt.NoCache || os.Getenv("MONOFLOW_NO_INCREMENTAL_TESTS") != "" {
+		return nil, false
+	}
+	inv, ok := parseVitest(pkg, c, r.RootDir)
+	if !ok || vitestIsolationOff(absPkgPath, r.RootDir) {
+		return nil, false
+	}
+	srcKey, kerr := r.cacheMgr.ComputePackageKey(pkg, r.upstreamKeys(pkg), c, "test-sources")
+	if kerr != nil || srcKey == "" {
+		return nil, false
+	}
+	p := &vitestPlan{inv: inv, c: c, srcKey: srcKey, current: currentTestFiles(absPkgPath), full: true}
+	var manifest testManifest
+	if rec, hit := r.cacheMgr.PeekVerification(manifestKey(srcKey)); hit && json.Unmarshal([]byte(rec.Output), &manifest) == nil {
+		p.full = false
+		for f, h := range p.current {
+			if old, known := manifest.Files[f]; !known || (old != h && !contains(manifest.Ran, f)) {
+				p.full = true // a new test file, or an edited one the suite does not run (it may be imported)
+				break
+			}
+		}
+	}
+	if !p.full {
+		for _, f := range manifest.Ran {
+			if _, exists := p.current[f]; !exists {
+				continue // deleted: nothing left to run
+			}
+			if rec, hit := r.cacheMgr.PeekVerification(p.fileKey(f)); !hit || rec.Status != "passed" {
+				p.pending = append(p.pending, f)
+			}
+		}
+		sort.Strings(p.pending)
+	}
+	return p, true
+}
+
+// recordVitest caches the per-file passes of a run of the plan (results: package-relative test
+// file -> passed) and, for a full run, the manifest of the files it ran.
+func (r *Runner) recordVitest(pkg *graph.PackageNode, p *vitestPlan, results map[string]bool) {
+	for f, passed := range results {
+		if _, ok := p.current[f]; ok && passed {
+			_ = r.cacheMgr.PutVerification(&cache.VerificationRecord{
+				Key: p.fileKey(f), Target: pkg.Name, Language: string(pkg.Language), Status: "passed",
+				CommandRun: p.c + " (" + f + ")", Timestamp: time.Now().UTC(),
+			})
+		}
+	}
+	if p.full {
+		m := testManifest{Files: p.current}
+		for f := range results {
+			m.Ran = append(m.Ran, f)
+		}
+		sort.Strings(m.Ran)
+		data, _ := json.Marshal(m)
+		_ = r.cacheMgr.PutVerification(&cache.VerificationRecord{
+			Key: manifestKey(p.srcKey), Target: pkg.Name, Language: string(pkg.Language), Status: "manifest",
+			CommandRun: p.c, Timestamp: time.Now().UTC(), Output: string(data),
+		})
+	}
+}
+
 // runTestsIncremental runs a vitest test command for pkg, narrowed to the test files without
 // a pass on their current inputs. handled=false: not applicable, run c as usual.
 func (r *Runner) runTestsIncremental(pkg *graph.PackageNode, c, absPkgPath string, opt VerifyOptions) (out []byte, err error, handled bool) {
-	if r.cacheMgr == nil || opt.NoCache || os.Getenv("MONOFLOW_NO_INCREMENTAL_TESTS") != "" {
-		return nil, nil, false
-	}
 	// -u rewrites snapshots: only in the files without a pass on their inputs (the ones that can
 	// mismatch), and records nothing (the files change under the run; the next verify keys them).
 	update := opt.UpdateSnapshots
@@ -147,51 +245,18 @@ func (r *Runner) runTestsIncremental(pkg *graph.PackageNode, c, absPkgPath strin
 		}
 		c = strings.TrimSuffix(c, " -u")
 	}
-	inv, ok := parseVitest(pkg, c, r.RootDir)
-	if !ok || vitestIsolationOff(absPkgPath, r.RootDir) {
+	p, ok := r.planVitest(pkg, c, absPkgPath, opt)
+	if !ok {
 		return nil, nil, false
-	}
-	srcKey, kerr := r.cacheMgr.ComputePackageKey(pkg, r.upstreamKeys(pkg), c, "test-sources")
-	if kerr != nil || srcKey == "" {
-		return nil, nil, false
-	}
-	current := currentTestFiles(absPkgPath)
-	fileKey := func(f string) string {
-		h := sha256.New()
-		fmt.Fprintf(h, "%s\n%s\n%s\n", srcKey, f, current[f])
-		return hex.EncodeToString(h.Sum(nil))
-	}
-	var manifest testManifest
-	full := true
-	if rec, hit := r.cacheMgr.PeekVerification(manifestKey(srcKey)); hit && json.Unmarshal([]byte(rec.Output), &manifest) == nil {
-		full = false
-		for f, h := range current {
-			if old, known := manifest.Files[f]; !known || (old != h && !contains(manifest.Ran, f)) {
-				full = true // a new test file, or an edited one the suite does not run (it may be imported)
-				break
-			}
-		}
 	}
 	if update {
-		inv.args = append(inv.args, "-u")
-		if full {
+		p.inv.args = append(p.inv.args, "-u")
+		if p.full {
 			return nil, nil, false
 		}
 	}
-	var pending []string
-	if !full {
-		for _, f := range manifest.Ran {
-			if _, exists := current[f]; !exists {
-				continue // deleted: nothing left to run
-			}
-			if rec, hit := r.cacheMgr.PeekVerification(fileKey(f)); !hit || rec.Status != "passed" {
-				pending = append(pending, f)
-			}
-		}
-		if len(pending) == 0 {
-			return []byte("all test files passed on these inputs\n"), nil, true
-		}
-		sort.Strings(pending)
+	if !p.full && len(p.pending) == 0 {
+		return []byte("all test files passed on these inputs\n"), nil, true
 	}
 
 	report, ferr := os.CreateTemp("", "monoflow-vitest-*.json")
@@ -201,17 +266,10 @@ func (r *Runner) runTestsIncremental(pkg *graph.PackageNode, c, absPkgPath strin
 	_ = report.Close()
 	defer os.Remove(report.Name())
 	var cmd string
-	if full {
-		cmd = inv.command(nil, report.Name())
+	if p.full {
+		cmd = p.inv.command(nil, report.Name())
 	} else {
-		files := make([]string, len(pending))
-		for i, f := range pending {
-			files[i] = f
-			if inv.root {
-				files[i] = path.Join(filepath.ToSlash(pkg.Path), f)
-			}
-		}
-		cmd = inv.command(files, report.Name())
+		cmd = p.inv.command(p.filters(pkg), report.Name())
 	}
 	out, err = r.runCheck(cmd, absPkgPath)
 	if update {
@@ -222,26 +280,7 @@ func (r *Runner) runTestsIncremental(pkg *graph.PackageNode, c, absPkgPath strin
 	if rerr != nil || len(results) == 0 {
 		return out, err, true // no per-file results (crashed, or no tests): nothing recorded
 	}
-	for f, passed := range results {
-		if _, ok := current[f]; ok && passed {
-			_ = r.cacheMgr.PutVerification(&cache.VerificationRecord{
-				Key: fileKey(f), Target: pkg.Name, Language: string(pkg.Language), Status: "passed",
-				CommandRun: c + " (" + f + ")", Timestamp: time.Now().UTC(),
-			})
-		}
-	}
-	if full {
-		m := testManifest{Files: current}
-		for f := range results {
-			m.Ran = append(m.Ran, f)
-		}
-		sort.Strings(m.Ran)
-		data, _ := json.Marshal(m)
-		_ = r.cacheMgr.PutVerification(&cache.VerificationRecord{
-			Key: manifestKey(srcKey), Target: pkg.Name, Language: string(pkg.Language), Status: "manifest",
-			CommandRun: c, Timestamp: time.Now().UTC(), Output: string(data),
-		})
-	}
+	r.recordVitest(pkg, p, results)
 	return out, err, true
 }
 
@@ -289,6 +328,15 @@ func readVitestReport(file, absPkgPath string) (map[string]bool, error) {
 	if err != nil {
 		return nil, err
 	}
+	files, err := parseVitestReport(data)
+	if err != nil {
+		return nil, err
+	}
+	return vitestResultsUnder(files, absPkgPath), nil
+}
+
+// parseVitestReport reads vitest's JSON report: test file as reported (absolute) -> status.
+func parseVitestReport(data []byte) (map[string]string, error) {
 	var rep struct {
 		TestResults []struct {
 			Name   string `json:"name"`
@@ -298,22 +346,33 @@ func readVitestReport(file, absPkgPath string) (map[string]bool, error) {
 	if err := json.Unmarshal(data, &rep); err != nil {
 		return nil, err
 	}
-	base := resolved(absPkgPath)
-	res := map[string]bool{}
+	files := map[string]string{}
 	for _, t := range rep.TestResults {
-		name := resolved(t.Name)
-		rel, err := filepath.Rel(base, name)
+		files[t.Name] = t.Status
+	}
+	return files, nil
+}
+
+// vitestResultsUnder keeps the report's files under dir: dir-relative file -> passed.
+func vitestResultsUnder(files map[string]string, dir string) map[string]bool {
+	base := resolved(dir)
+	res := map[string]bool{}
+	for name, status := range files {
+		rel, err := filepath.Rel(base, resolved(name))
 		if err != nil || strings.HasPrefix(rel, "..") {
 			continue
 		}
-		res[filepath.ToSlash(rel)] = t.Status == "passed"
+		res[filepath.ToSlash(rel)] = status == "passed"
 	}
-	return res, nil
+	return res
 }
 
 // resolved is p with symlinks resolved (macOS: /tmp is /private/tmp), or p when it cannot be.
 // The longest existing prefix is resolved, so a path that does not exist (yet) still compares.
 func resolved(p string) string {
+	if a, err := filepath.Abs(p); err == nil {
+		p = a // comparable with the absolute paths tools report
+	}
 	rest := ""
 	for dir := p; ; dir = filepath.Dir(dir) {
 		if r, err := filepath.EvalSymlinks(dir); err == nil {

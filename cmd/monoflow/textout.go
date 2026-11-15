@@ -283,7 +283,7 @@ func emit(v map[string]any, order ...string) {
 func printOut(v any) {
 	data, _ := json.MarshalIndent(v, "", "  ")
 	if jsonMode() {
-		fmt.Println(string(data))
+		fmt.Println(string(withSchema(data)))
 		return
 	}
 	var node any
@@ -294,6 +294,29 @@ func printOut(v any) {
 	var b strings.Builder
 	renderText(&b, node, "")
 	fmt.Print(b.String())
+}
+
+// JSONSchemaVersion is the "schema" of every --json object MonoFlow prints (#39). Within one
+// version, fields are only ever added; a rename or removal bumps it, and the old name is still
+// printed for one more version. Documented in docs/json-output.md and
+// docs/schema/monoflow-output.schema.json.
+const JSONSchemaVersion = 1
+
+// withSchema adds "schema": JSONSchemaVersion as the first key of a JSON object (arrays and
+// scalars are printed as they are).
+func withSchema(data []byte) []byte {
+	trimmed := strings.TrimSpace(string(data))
+	var top map[string]json.RawMessage
+	if !strings.HasPrefix(trimmed, "{") || json.Unmarshal(data, &top) != nil {
+		return data
+	}
+	if _, ok := top["schema"]; ok {
+		return data
+	}
+	if trimmed == "{}" {
+		return []byte(fmt.Sprintf("{\n  \"schema\": %d\n}", JSONSchemaVersion))
+	}
+	return []byte(fmt.Sprintf("{\n  \"schema\": %d,%s", JSONSchemaVersion, strings.TrimPrefix(trimmed, "{")))
 }
 
 // renderText writes a JSON value as indented "key: value" text: status-like keys first, empty

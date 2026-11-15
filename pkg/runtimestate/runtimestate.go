@@ -69,3 +69,14 @@ func IgnorePatterns() []string {
 	}
 	return append(out, "/.agents/bin/monoflow")
 }
+
+// IsRuntimePath reports whether the repo-relative path is (inside) MonoFlow runtime state.
+func IsRuntimePath(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	for _, p := range Paths {
+		if rel == p || strings.HasPrefix(rel, p+"/") {
+			return true
+		}
+	}
+	return rel == ".agents/bin/monoflow"
+}

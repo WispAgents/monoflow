@@ -84,7 +84,7 @@ func hookFlag(name string) string {
 // PostToolUse / UserPromptSubmit / SessionStart hooks (--event=<name>, JSON output);
 // other harnesses: --format=text prints plain text (nothing when there is nothing new).
 func hookDeliver(root string) {
-	_ = readHookStdin() // hook payload is not needed
+	recordHookSession(root, readHookStdin())
 	maybeVerifyInBackground(root)
 	branch := currentBranch(root)
 	em := events.NewEventManager(root)
@@ -121,7 +121,9 @@ func hookStop(root string) {
 	var payload struct {
 		StopHookActive bool `json:"stop_hook_active"`
 	}
-	_ = json.Unmarshal(readHookStdin(), &payload)
+	stdin := readHookStdin()
+	_ = json.Unmarshal(stdin, &payload)
+	recordHookSession(root, stdin)
 	checkPushedBranchConflicts(root) // the base may have moved under a pushed branch
 	branch := currentBranch(root)
 	wait := stopWaitMinutes(root)

@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ func handleVerify(rootDir string, metrics *telemetry.Collector) {
 	verifyBase := ""
 	verboseOut := false
 	noFix := false
+	maxPackages := 0
 
 	// Check flags
 	for _, arg := range os.Args[2:] {
@@ -63,6 +65,13 @@ func handleVerify(rootDir string, metrics *telemetry.Collector) {
 			opts.Strict = true
 		} else if arg == "--no-fix" {
 			noFix = true
+		} else if strings.HasPrefix(arg, "--max-packages=") {
+			n, err := strconv.Atoi(strings.TrimPrefix(arg, "--max-packages="))
+			if err != nil || n < 1 {
+				fmt.Fprintln(os.Stderr, "monoflow verify: --max-packages wants a positive number")
+				exit(2)
+			}
+			maxPackages = n
 		}
 	}
 
@@ -85,9 +94,15 @@ func handleVerify(rootDir string, metrics *telemetry.Collector) {
 	// answer for exactly this state of the tree (see speculate.go).
 	plain := true
 	for _, a := range os.Args[2:] {
-		if a != "--affected" && a != "--verbose" {
+		if a != "--affected" && a != "--verbose" && !strings.HasPrefix(a, "--max-packages=") {
 			plain = false
 		}
+	}
+	if inCI() {
+		// The agent's loop (changed packages first, dependents in the background, PENDING) has no
+		// next call in CI: a CI job ended PENDING with exit 1 once the changed package took longer
+		// than the wait budget. CI checks everything, in this call.
+		plain = false
 	}
 	if !recording && plain && !jsonMode() {
 		// A finished result for these files is printed at once. A run still in progress is not
@@ -134,15 +149,25 @@ func handleVerify(rootDir string, metrics *telemetry.Collector) {
 		printRaw(fmt.Sprintf(`{"status": "failed", "error": %q}`, err))
 		exit(1)
 	}
+	printGraphWarnings(g)
 
 	runner := verify.NewRunner(rootDir)
 	runner.SetGraph(g)
 	start := time.Now()
 
 	var res verify.SuiteResult
+	var unmapped []string
 
 	if targetPkg != "" {
 		pkg, exists := resolvePackageArg(g, rootDir, targetPkg)
+		if paths := g.DuplicateNames()[targetPkg]; !exists && len(paths) > 0 {
+			var names []string
+			for _, p := range paths {
+				names = append(names, graph.QualifiedName(targetPkg, p))
+			}
+			printOut(map[string]any{"status": "failed", "error": fmt.Sprintf("%d packages are named %q: pick one with --package=%s (or its path)", len(paths), targetPkg, strings.Join(names, " | "))})
+			exit(1)
+		}
 		if !exists {
 			printRaw(fmt.Sprintf(`{"status": "failed", "error": "package '%s' not found (use a name from 'monoflow graph list' or a path inside one)"}`, targetPkg))
 			exit(1)
@@ -155,12 +180,16 @@ func handleVerify(rootDir string, metrics *telemetry.Collector) {
 			names = append(names, p.Name)
 		}
 		opts.ChangedFiles, opts.AllPackages = getGitChangedFiles(rootDir), true
+		guardAffectedSize(rootDir, g, names, maxPackages)
 		res = runner.VerifyPackages(g, names, opts)
 	} else {
 		changedFiles := getGitChangedFiles(rootDir)
 		if verifyBase != "" {
 			changedFiles = changedFilesSince(rootDir, verifyBase)
 		}
+		affected := g.ComputeAffected(changedFiles)
+		guardAffectedSize(rootDir, g, affected.AllAffected, maxPackages)
+		unmapped = affected.Unmapped
 		res = runner.VerifyAffected(g, changedFiles, opts)
 		res.DurationMs = float64(time.Since(start).Microseconds()) / 1000.0
 	}
@@ -239,6 +268,10 @@ func handleVerify(rootDir string, metrics *telemetry.Collector) {
 		out = c
 	}
 	if c, ok := out.(map[string]any); ok {
+		if len(unmapped) > 0 {
+			c["unmapped"] = unmapped
+			c["unmapped_note"] = "no package owns these files, so nothing was checked for them; name them in global_inputs or ignore_inputs (.agents/monoflow.config.json)"
+		}
 		if len(fixed.Fixed) > 0 {
 			c["formatted"] = fixed.Fixed
 		}
@@ -328,6 +361,48 @@ func handleVerify(rootDir string, metrics *telemetry.Collector) {
 	} else {
 		cb.Reset("active_task", targetKey)
 	}
+}
+
+// inCI reports whether this runs in a CI job (GitHub Actions, GitLab, Buildkite, ... set CI).
+func inCI() bool {
+	v := strings.ToLower(os.Getenv("CI"))
+	return (v != "" && v != "false" && v != "0") || os.Getenv("GITHUB_ACTIONS") == "true"
+}
+
+// printGraphWarnings reports, on stderr, what the graph could not take as it is (#35).
+func printGraphWarnings(g *graph.DependencyGraph) {
+	for _, w := range g.Warnings() {
+		fmt.Fprintln(os.Stderr, "monoflow: warning: "+w)
+	}
+}
+
+// guardAffectedSize says up front how big a verify is when it reaches most of the repository
+// (#41: a kernel change reached 131 of 149 packages, so verify was really --all, 2 h+), and
+// refuses past --max-packages so an agent leaves that run to CI.
+func guardAffectedSize(rootDir string, g *graph.DependencyGraph, names []string, maxPackages int) {
+	total := len(g.GetAllPackages())
+	n := len(names)
+	big := n >= 20 && n*2 >= total
+	if !big && (maxPackages == 0 || n <= maxPackages) {
+		return
+	}
+	est := verify.EstimateVerify(rootDir, names)
+	line := fmt.Sprintf("affected: %d/%d packages", n, total)
+	if est.Wall > 0 {
+		line += fmt.Sprintf(", est. %s from cache history (%d of them timed)", est.Wall.Round(time.Second), est.Timed)
+	}
+	if maxPackages > 0 && n > maxPackages {
+		printOut(map[string]any{
+			"status":       "refused",
+			"error":        fmt.Sprintf("%s: more than --max-packages=%d", line, maxPackages),
+			"affected":     n,
+			"total":        total,
+			"estimate_sec": int(est.Wall.Seconds()),
+			"hint":         "leave this one to CI (monoflow ship), or verify --package=<p> for the packages you changed",
+		})
+		exit(1)
+	}
+	fmt.Fprintln(os.Stderr, line+" (cap it with --max-packages=N)")
 }
 
 func handleProofVerification(rootDir, taskID string) {

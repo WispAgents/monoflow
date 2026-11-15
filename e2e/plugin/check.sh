@@ -28,11 +28,11 @@ for spec in "${REPOS[@]}"; do
     jq -r '"edges=\([.packages[].dependencies // [] | length]|add) pkgs_without_test_cmd=\([.packages[]|select((.test_cmd//"")=="")]|length)"' .agents/monoflow.config.json 2>/dev/null
     echo "dirty_after_init: $(git status --short | wc -l | tr -d ' ') files ($(git status --short | awk '{print $2}' | head -6 | tr '\n' ' '))"
     echo "probe=$probe"
-    t0=$(ms); "$BIN" graph impact "$probe" > "$WORK/$name.impact.json" 2>&1; t1=$(ms)
+    t0=$(ms); "$BIN" graph impact "$probe" > "$WORK/$name.impact.json" 2>"$WORK/$name.impact.err"; t1=$(ms)
     jq -c '{package, direct, dependents}' "$WORK/$name.impact.json" 2>/dev/null || head -c 300 "$WORK/$name.impact.json"
     echo "impact_ms=$((t1-t0))"
     echo "// monoflow plugin probe" >> "$probe"
-    t0=$(ms); "$BIN" graph affected > "$WORK/$name.affected.json" 2>&1; t1=$(ms)
+    t0=$(ms); "$BIN" graph affected > "$WORK/$name.affected.json" 2>"$WORK/$name.affected.err"; t1=$(ms)
     jq -c '{directly_changed, all: (.all_affected|length)}' "$WORK/$name.affected.json" 2>/dev/null || head -c 300 "$WORK/$name.affected.json"
     echo "affected_ms=$((t1-t0))"
     git checkout -q -- "$probe"

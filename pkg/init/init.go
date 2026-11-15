@@ -19,10 +19,66 @@ type InitResult struct {
 	PackageCount   int      `json:"package_count"`
 	DiscoveredPkgs []string `json:"discovered_packages"`
 	ConfigPath     string   `json:"config_path"`
+	Installed      []string `json:"installed"` // components (see AllComponents)
 }
 
-// InitRepo configures MonoFlow for an existing or new Git repository.
+// Components init can install besides the graph and verify (config, .agents, binary, .gitignore),
+// which are always set up. Each is chosen with init --with=<a,b>; all of them by default.
+const (
+	CompAgents  = "agents"  // MonoFlow section in AGENTS.md / CLAUDE.md, .agents/rules and skills
+	CompHarness = "harness" // .claude/settings.json hooks and the opencode plugin (event delivery)
+	CompHooks   = "hooks"   // git shield hooks (pre-commit / pre-push) in the shared hooks dir
+	CompShim    = "shim"    // .agents/bin/git interception shim
+)
+
+// AllComponents is what init installs without --with.
+var AllComponents = []string{CompAgents, CompHarness, CompHooks, CompShim}
+
+// Options selects what InitRepo installs.
+type Options struct {
+	// With lists the components to install (see AllComponents); nil means all of them, an empty
+	// non-nil slice none (init --minimal: graph and verify only).
+	With []string
+}
+
+func (o Options) has(c string) bool {
+	if o.With == nil {
+		return true
+	}
+	for _, w := range o.With {
+		if w == c {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseComponents parses an init --with list ("hooks,shim"; "all"; "none").
+func ParseComponents(list string) ([]string, error) {
+	out := []string{}
+	for _, c := range strings.Split(list, ",") {
+		c = strings.TrimSpace(c)
+		switch c {
+		case "":
+		case "all":
+			out = append(out, AllComponents...)
+		case "none":
+		case CompAgents, CompHarness, CompHooks, CompShim:
+			out = append(out, c)
+		default:
+			return nil, fmt.Errorf("unknown init component %q (want %s, all or none)", c, strings.Join(AllComponents, ", "))
+		}
+	}
+	return out, nil
+}
+
+// InitRepo configures MonoFlow for an existing or new Git repository, with every component.
 func InitRepo(targetDir string, binarySrcPath string) (*InitResult, error) {
+	return InitRepoWith(targetDir, binarySrcPath, Options{})
+}
+
+// InitRepoWith is InitRepo installing only the components opts selects.
+func InitRepoWith(targetDir string, binarySrcPath string, opts Options) (*InitResult, error) {
 	absTarget, err := filepath.Abs(targetDir)
 	if err != nil {
 		return nil, err
@@ -96,21 +152,23 @@ func InitRepo(targetDir string, binarySrcPath string) (*InitResult, error) {
 	}
 
 	// 5. Write Rules and Skills
-	rulesPath := filepath.Join(agentsDir, "rules", "agentic-monorepo.md")
-	if err := os.WriteFile(rulesPath, []byte(AgentRuleTemplate), 0644); err != nil {
-		return nil, err
-	}
+	if opts.has(CompAgents) {
+		rulesPath := filepath.Join(agentsDir, "rules", "agentic-monorepo.md")
+		if err := os.WriteFile(rulesPath, []byte(AgentRuleTemplate), 0644); err != nil {
+			return nil, err
+		}
 
-	// Agent instructions: the same delimited MonoFlow section in AGENTS.md and CLAUDE.md
-	// (created when missing; any existing project instructions are kept after it). Claude Code
-	// loads CLAUDE.md, not AGENTS.md: with only a pointer there, or no CLAUDE.md at all, Claude
-	// sessions started without the guide.
-	_ = mergeSection(filepath.Join(absTarget, "AGENTS.md"), AgentRuleTemplate, true)
-	_ = mergeSection(filepath.Join(absTarget, "CLAUDE.md"), AgentRuleTemplate, true)
+		// Agent instructions: the same delimited MonoFlow section in AGENTS.md and CLAUDE.md
+		// (created when missing; any existing project instructions are kept after it). Claude Code
+		// loads CLAUDE.md, not AGENTS.md: with only a pointer there, or no CLAUDE.md at all, Claude
+		// sessions started without the guide.
+		_ = mergeSection(filepath.Join(absTarget, "AGENTS.md"), AgentRuleTemplate, true)
+		_ = mergeSection(filepath.Join(absTarget, "CLAUDE.md"), AgentRuleTemplate, true)
 
-	skillPath := filepath.Join(agentsDir, "skills", "monoflow", "SKILL.md")
-	if err := os.WriteFile(skillPath, []byte(AgentSkillTemplate), 0644); err != nil {
-		return nil, err
+		skillPath := filepath.Join(agentsDir, "skills", "monoflow", "SKILL.md")
+		if err := os.WriteFile(skillPath, []byte(AgentSkillTemplate), 0644); err != nil {
+			return nil, err
+		}
 	}
 
 	// 6. Write quarantine.json (empty list)
@@ -155,16 +213,38 @@ func InitRepo(targetDir string, binarySrcPath string) (*InitResult, error) {
 	linkRootBinary(absTarget)
 
 	// 9b. Agent harness hooks: redirect raw build/test/git commands to MonoFlow.
-	_ = InstallAgentHooks(absTarget)
+	if opts.has(CompHarness) {
+		_ = InstallAgentHooks(absTarget)
+	}
 
 	// 10. Install Git Shield Hooks into the repository's effective hooks directory
-	if _, err := InstallShieldHooks(absTarget); err != nil {
-		return nil, fmt.Errorf("failed to install git shield hooks: %w", err)
+	if opts.has(CompHooks) {
+		if _, err := InstallShieldHooks(absTarget); err != nil {
+			return nil, fmt.Errorf("failed to install git shield hooks: %w", err)
+		}
 	}
 
 	// 11. Install Git Interception Shim into .agents/bin/git
-	gitShimPath := filepath.Join(agentsDir, "bin", "git")
-	gitShim := `#!/bin/sh
+	if opts.has(CompShim) {
+		_ = os.WriteFile(filepath.Join(agentsDir, "bin", "git"), []byte(gitShim), 0755)
+	}
+
+	installed := []string{}
+	for _, c := range AllComponents {
+		if opts.has(c) {
+			installed = append(installed, c)
+		}
+	}
+	return &InitResult{
+		RepoRoot:       absTarget,
+		PackageCount:   len(pkgNodes),
+		DiscoveredPkgs: pkgNames,
+		ConfigPath:     configPath,
+		Installed:      installed,
+	}, nil
+}
+
+const gitShim = `#!/bin/sh
 # MonoFlow Git Interception Shim
 case "$1" in
     push)
@@ -180,15 +260,6 @@ case "$1" in
         ;;
 esac
 `
-	_ = os.WriteFile(gitShimPath, []byte(gitShim), 0755)
-
-	return &InitResult{
-		RepoRoot:       absTarget,
-		PackageCount:   len(pkgNodes),
-		DiscoveredPkgs: pkgNames,
-		ConfigPath:     configPath,
-	}, nil
-}
 
 // shieldMarker identifies hook scripts written by MonoFlow.
 const shieldMarker = "MonoFlow Shield"
@@ -389,13 +460,20 @@ func linkRootBinary(root string) {
 // mergeConfiguredCommands keeps the commands an existing config sets for a package (matched by
 // name) over the discovered ones; dependencies and paths come from discovery.
 func mergeConfiguredCommands(root string, discovered, configured []graph.PackageNode) []graph.PackageNode {
+	// Matched by directory first: a package renamed to name@path because another package has
+	// its name (see graph.QualifiedName) keeps the commands configured for it under its old name.
 	byName := make(map[string]graph.PackageNode, len(configured))
+	byPath := make(map[string]graph.PackageNode, len(configured))
 	for _, p := range configured {
 		graph.UpgradeLegacyPythonCommands(root, &p)
 		byName[p.Name] = p
+		byPath[filepath.ToSlash(filepath.Clean(p.Path))] = p
 	}
 	for i, p := range discovered {
-		old, ok := byName[p.Name]
+		old, ok := byPath[filepath.ToSlash(filepath.Clean(p.Path))]
+		if !ok {
+			old, ok = byName[p.Name]
+		}
 		if !ok {
 			continue
 		}

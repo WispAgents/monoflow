@@ -22,7 +22,7 @@ func handleCommit(rootDir string) {
 	msg := "agent checkpoint commit"
 	noOuter := false
 	for i, arg := range os.Args[2:] {
-		if arg == "-m" && i+1 < len(os.Args[2:]) {
+		if (arg == "-m" || arg == "-am") && i+1 < len(os.Args[2:]) {
 			msg = os.Args[2:][i+1]
 		}
 		if arg == "--no-outer" {
@@ -279,6 +279,11 @@ func handleSync(rootDir string) {
 			rebase = true
 			autostash = true
 		}
+	}
+
+	if autostash && len(uncommittedFiles(rootDir)) > 0 {
+		// The stash would hold other agents' uncommitted work too; on a conflict it stays stashed.
+		refuseInSharedWorktree(rootDir, "sync with uncommitted changes (autostash)")
 	}
 
 	// 1. Fetch remote ref

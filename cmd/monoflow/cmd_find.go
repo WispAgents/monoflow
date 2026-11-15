@@ -18,9 +18,12 @@ import (
 func handleFind(rootDir string) {
 	var pattern string
 	fixed := true
+	literal := false // after "--", every argument is text
 	for _, a := range os.Args[2:] {
 		switch {
-		case a == "--regex" || a == "-E":
+		case a == "--" && !literal:
+			literal = true
+		case !literal && (a == "--regex" || a == "-E"):
 			fixed = false
 		case pattern == "":
 			pattern = a

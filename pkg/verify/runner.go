@@ -140,6 +140,10 @@ type Runner struct {
 	// assumeEdits makes baselineSHA treat the tree as having local edits (WarmBaseline runs
 	// before the agent's first edit and must prepare the baseline its later verifies use).
 	assumeEdits bool
+	// batched holds checks already run for several packages at once (see batch.go): package
+	// -> command -> its outcome, taken by the package's VerifyTarget.
+	batchMu sync.Mutex
+	batched map[string]map[string]batchOutcome
 }
 
 type rootRun struct {
@@ -231,6 +235,7 @@ func (r *Runner) SetCacheManager(cm *cache.Manager) {
 // VerifyTarget executes the fastest verification commands for a single package with caching.
 func (r *Runner) VerifyTarget(pkg *graph.PackageNode, opt VerifyOptions) TargetResult {
 	start := time.Now()
+	defer r.dropBatched(pkg.Name) // a later run of the package (a retry) runs its checks
 	res := TargetResult{
 		Target:   pkg.Name,
 		Language: string(pkg.Language),
@@ -316,6 +321,7 @@ func (r *Runner) VerifyTarget(pkg *graph.PackageNode, opt VerifyOptions) TargetR
 	// 3. Cache Miss: run each check in order, stopping at the first failure.
 	var out []byte
 	var err error
+	var batchDiags []DiagnosticError // the failing check's diagnostics, from a batched run
 	for i, c := range cmds {
 		ck := r.commandKey(pkg, c, opt)
 		if ck != "" {
@@ -325,7 +331,11 @@ func (r *Runner) VerifyTarget(pkg *graph.PackageNode, opt VerifyOptions) TargetR
 		}
 		var o []byte
 		handled := false
-		if c == pkg.TestCmd || (opt.UpdateSnapshots && c == pkg.TestCmd+" -u") {
+		batchDiags = nil
+		if b, ok := r.takeBatched(pkg.Name, c); ok {
+			o, err, batchDiags, handled = b.out, b.err, b.diags, true
+		}
+		if !handled && c == pkg.TestCmd || (opt.UpdateSnapshots && c == pkg.TestCmd+" -u") {
 			o, err, handled = r.runTestsIncremental(pkg, c, absPkgPath, opt)
 		}
 		if !handled {
@@ -349,8 +359,11 @@ func (r *Runner) VerifyTarget(pkg *graph.PackageNode, opt VerifyOptions) TargetR
 
 	if err != nil {
 		rawOutput := string(out)
-		diagnostics := ParseDiagnostics(rawOutput)
-		ResolveGoTestFiles(diagnostics, absPkgPath)
+		diagnostics := batchDiags
+		if diagnostics == nil {
+			diagnostics = ParseDiagnostics(rawOutput)
+			ResolveGoTestFiles(diagnostics, absPkgPath)
+		}
 
 		// Filter quarantined flaky tests
 		activeErrors := make([]DiagnosticError, 0)
@@ -720,9 +733,25 @@ func (r *Runner) VerifyPackages(g *graph.DependencyGraph, names []string, opt Ve
 	// suite started last and set the end of the run).
 	times := loadDurations(r.RootDir)
 	order := slowestFirst(r.RootDir, g, names, times)
-	next := make(chan int, len(order))
+	// Checks that can run for several packages in one process (cargo, tsc, vitest) run as one
+	// job per group (see batch.go), ahead of the packages checked on their own.
+	type work struct {
+		job *batchJob
+		idx int
+	}
+	jobs := r.planBatches(g, names, opt)
+	next := make(chan work, len(order)+len(jobs))
+	inJob := map[int]bool{}
+	for _, j := range jobs {
+		next <- work{job: j}
+		for _, i := range j.idx {
+			inJob[i] = true
+		}
+	}
 	for _, i := range order {
-		next <- i
+		if !inJob[i] {
+			next <- work{idx: i}
+		}
 	}
 	close(next)
 	var timesMu sync.Mutex
@@ -730,7 +759,18 @@ func (r *Runner) VerifyPackages(g *graph.DependencyGraph, names []string, opt Ve
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for idx := range next {
+			for item := range next {
+				if item.job != nil {
+					r.runBatchJob(item.job, opt)
+					for _, idx := range item.job.idx {
+						// not timed: most of a batched package's check ran in the job
+						if pkg, exists := g.GetPackage(names[idx]); exists {
+							results[idx] = r.VerifyTarget(pkg, opt)
+						}
+					}
+					continue
+				}
+				idx := item.idx
 				name := names[idx]
 				pkg, exists := g.GetPackage(name)
 				if !exists {
@@ -942,6 +982,15 @@ func PrepareCommands(g *graph.DependencyGraph, pkgs []*graph.PackageNode) []stri
 			order = append(order, p.PrepareCmd)
 		}
 		for _, d := range g.GetTransitiveUpstream(p.Name) {
+			// Task runners know manifest names; a name several packages share (name@path) is
+			// filtered by its directory instead (pnpm and turbo take --filter=./<dir>).
+			if dp, ok := g.GetPackage(d); ok && dp.ManifestName != "" {
+				if strings.Contains(p.PrepareCmd, " nx run-many") {
+					d = dp.RawName()
+				} else {
+					d = "./" + filepath.ToSlash(dp.Path)
+				}
+			}
 			deps[p.PrepareCmd][d] = true
 		}
 	}
