@@ -107,7 +107,7 @@ func TestMain(m *testing.M) {
 	// suite from a `MONOFLOW_NO_SPECULATE=1 monoflow commit`, and every speculation test failed
 	// (no background run ever started). Tests that want them set them per command.
 	for _, k := range []string{"MONOFLOW_NO_SPECULATE", "MONOFLOW_SHARED_WORKTREE", "MONOFLOW_SPECULATE_HERE",
-		"MONOFLOW_RECORD_KEY", "MONOFLOW_NO_BATCH", "MONOFLOW_FORMAT"} {
+		"MONOFLOW_RECORD_KEY", "MONOFLOW_NO_BATCH", "MONOFLOW_FORMAT", "CI", "GITHUB_ACTIONS"} {
 		_ = os.Unsetenv(k)
 	}
 	_ = os.Setenv("MONOFLOW_NO_WARM", "1")

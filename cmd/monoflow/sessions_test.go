@@ -37,3 +37,18 @@ func TestSpeculationOffWhenShared(t *testing.T) {
 		t.Fatal("sessions leak across checkouts")
 	}
 }
+
+func TestInCI(t *testing.T) {
+	for v, want := range map[string]bool{"": false, "false": false, "0": false, "true": true, "1": true} {
+		t.Setenv("GITHUB_ACTIONS", "")
+		t.Setenv("CI", v)
+		if inCI() != want {
+			t.Errorf("CI=%q: %v", v, !want)
+		}
+	}
+	t.Setenv("CI", "")
+	t.Setenv("GITHUB_ACTIONS", "true")
+	if !inCI() || !speculationOff(t.TempDir()) {
+		t.Error("GitHub Actions is CI, and nothing speculates there")
+	}
+}

@@ -98,6 +98,12 @@ func handleVerify(rootDir string, metrics *telemetry.Collector) {
 			plain = false
 		}
 	}
+	if inCI() {
+		// The agent's loop (changed packages first, dependents in the background, PENDING) has no
+		// next call in CI: a CI job ended PENDING with exit 1 once the changed package took longer
+		// than the wait budget. CI checks everything, in this call.
+		plain = false
+	}
 	if !recording && plain && !jsonMode() {
 		// A finished result for these files is printed at once. A run still in progress is not
 		// waited for here: it checks everything and finishes late, so this verify checks the
@@ -355,6 +361,12 @@ func handleVerify(rootDir string, metrics *telemetry.Collector) {
 	} else {
 		cb.Reset("active_task", targetKey)
 	}
+}
+
+// inCI reports whether this runs in a CI job (GitHub Actions, GitLab, Buildkite, ... set CI).
+func inCI() bool {
+	v := strings.ToLower(os.Getenv("CI"))
+	return (v != "" && v != "false" && v != "0") || os.Getenv("GITHUB_ACTIONS") == "true"
 }
 
 // printGraphWarnings reports, on stderr, what the graph could not take as it is (#35).

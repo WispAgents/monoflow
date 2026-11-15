@@ -67,8 +67,8 @@ func activeSessions(root string) int {
 // speculationOff reports whether background verify is off for this checkout: by environment,
 // by the "speculate" setting, or (when that is unset) because the checkout is shared.
 func speculationOff(root string) bool {
-	if os.Getenv("MONOFLOW_NO_SPECULATE") != "" {
-		return true
+	if os.Getenv("MONOFLOW_NO_SPECULATE") != "" || inCI() {
+		return true // nobody edits a CI checkout: nothing to precompute
 	}
 	s := graph.LoadSettings(root)
 	if s.Speculate != nil {
