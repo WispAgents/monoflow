@@ -130,7 +130,14 @@ func TestVerifyReusesResultForSameFiles(t *testing.T) {
 	if err := first.Start(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	// Start the second once the first has registered as the foreground run (its .run marker),
+	// not after a fixed delay: on a loaded machine (local CI next to other jobs) 700 ms was not
+	// enough and the second verify ran on its own.
+	for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if runs, _ := filepath.Glob(filepath.Join(specDir(repo), "*.run")); len(runs) > 0 {
+			break
+		}
+	}
 	second, _ := verify().CombinedOutput()
 	_ = first.Wait()
 	if !strings.HasPrefix(firstOut.String(), "FAIL") {
